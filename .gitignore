@@ -1,3 +1,7 @@
+# Data and results (local only)
+data/
+results/
+
 # Segmentation outputs and large files
 Ctrl_1A2/
 HUK1_COR1/

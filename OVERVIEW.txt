@@ -1,0 +1,312 @@
+================================================================================
+TUBULE SEGMENTATION PIPELINE - OVERVIEW
+================================================================================
+Project: Automated kidney tubule instance segmentation in histopathology images
+Lab:     JHU FanLab (Edmund project)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+PURPOSE
+--------------------------------------------------------------------------------
+This project automatically detects and delineates individual kidney tubules from
+histopathology microscopy images. It supports four staining types: H&E, PAS,
+Sil (Sirius Red), and Tri (Trichrome). The output is a GeoJSON file containing
+polygon annotations for every tubule found, compatible with QuPath for downstream
+pathology analysis.
+
+The core challenge is separating touching or overlapping tubules. This pipeline
+addresses it by predicting a per-pixel distance-to-boundary map (distance
+transform), which has clear peaks at tubule centers. Those peaks become seeds for
+instance separation, followed by SAM2-based refinement to produce precise masks.
+
+
+--------------------------------------------------------------------------------
+REPOSITORY STRUCTURE
+--------------------------------------------------------------------------------
+tubule_segmentation/
+  README.md                    -- Usage documentation and setup instructions
+  environment.yaml             -- Conda environment (Python 3.10, PyTorch 2.1,
+                                  CUDA 11.8)
+  checkpoints/
+    best_distance_model.pt     -- Trained model weights (~20 MB); required for
+                                  inference
+  data_preprocessing.py        -- Prepares raw annotated data for training
+  train.py                     -- Trains the distance prediction model
+  patch_inference.py           -- Runs segmentation on a single image patch
+  wsi_inference.py             -- Runs segmentation on a whole slide image (WSI)
+  merge_segmentation.py        -- Post-processes WSI output: removes artifacts,
+                                  merges/separates overlapping detections
+
+
+--------------------------------------------------------------------------------
+HOW IT WORKS: FOUR-STEP PIPELINE
+--------------------------------------------------------------------------------
+
+STEP 1 -- DATA PREPROCESSING  (data_preprocessing.py)
+------------------------------------------------------
+Input:  Raw images + separate masks for proximal (pt) and distal (dt) tubules,
+        across four stain types (he, pas, sil, tri). Expected folder layout:
+          he-pt-data/, he-dt-data/, pas-pt-data/, ... (8 folders total)
+
+Process:
+  1. Resize all images and masks to 1024x1024 pixels.
+  2. Merge proximal and distal masks into a single binary mask per image.
+  3. Overlap check: if two mask regions share >30% area, they are treated as
+     the same structure (one is discarded to avoid duplication).
+  4. Binarize masks to 0 or 255.
+
+Output: data_combined/images/ and data_combined/masks/
+
+Command:
+  python data_preprocessing.py ./data ./data_combined
+
+
+STEP 2 -- MODEL TRAINING  (train.py)
+-------------------------------------
+Goal: Train a lightweight head to predict, for every pixel, its distance to the
+nearest tubule boundary. Pixels at tubule centers get high values; boundary and
+background pixels get values near zero.
+
+Architecture:
+  - Backbone A: OpenMidnight (DINOv2-G ViT) -- FROZEN
+      Outputs 1536-dimensional features at 73x73 spatial resolution.
+      Provides rich semantic understanding of histological structures.
+  - Backbone B: SAM2.1 Hiera B+ encoder -- FROZEN
+      Outputs 256-dimensional features at 64x64 spatial resolution.
+      Provides strong spatial/structural features from the segmentation foundation
+      model.
+  - AlignmentBridge -- TRAINABLE (~1M params)
+      Fuses the two backbones: upsamples both to 64x64, concatenates (1792-dim),
+      then projects to 256-dim via Conv1x1 + GELU + Conv1x1.
+  - DistanceHead -- TRAINABLE (~1M params)
+      Upsamples 64x64 to 256x256 through transposed convolution + conv blocks.
+      Final sigmoid activation outputs values in [0, 1].
+
+Loss function:
+  Combined MSE + Peak-weighted MSE. The peak weight (1.0 + target * 4.0) places
+  extra emphasis on getting tubule centers correct, since centers are the key
+  cue for separating touching instances.
+
+Training config:
+  IMG_SIZE=1024, OUTPUT_SIZE=256, BATCH_SIZE=8, EPOCHS=30, LR=1e-4,
+  MAX_DISTANCE=50 pixels
+
+Data augmentation (heavy, histopathology-specific):
+  Geometric: horizontal/vertical flip, rotation, shift+scale, elastic distortion
+  Color:     ColorJitter, HueSaturation, RGBShift
+  Intensity: GaussianBlur, MedianBlur, GaussNoise
+
+Output: checkpoints/best_distance_model.pt  (saved whenever validation loss
+        improves), plus per-epoch visualizations in distance_outputs/
+
+Command:
+  python train.py
+
+
+STEP 3 -- INFERENCE  (patch_inference.py  OR  wsi_inference.py)
+-----------------------------------------------------------------
+
+  A) Single-patch mode  (patch_inference.py)
+  -------------------------------------------
+  For one 1024x1024 image.
+
+  Process:
+    1. Load image and resize to 1024x1024.
+    2. Extract features from frozen OpenMidnight + SAM2 encoder.
+    3. AlignmentBridge + DistanceHead predict a 256x256 distance map.
+    4. Instance separation:
+         a. Otsu threshold (x THRESH_FACTOR=0.8) to binarize distance map.
+         b. Morphological erosion (5 iterations) to shrink regions until
+            touching tubules become separate blobs.
+         c. Connected-components labeling -- each blob is one seed.
+         d. Dilate seeds back and resolve centroid-based collisions for
+            overlapping regions.
+    5. SAM2 refinement: for each seed, use its bounding box + distance mask
+       as prompts to SAM2's interactive decoder. Select the highest-confidence
+       mask from 3 candidates.
+    6. Filter by area (MIN_TUBULE_AREA=2000, MAX_TUBULE_AREA=400000 pixels).
+    7. Convert contours to GeoJSON Polygon features; fix self-intersections with
+       Shapely buffer(0).
+
+  Command:
+    python patch_inference.py <input_image.png> <output.geojson>
+
+
+  B) Whole-slide image mode  (wsi_inference.py)
+  -----------------------------------------------
+  For large TIFF/PNG slide images that cannot fit in memory.
+
+  Process:
+    1. Load WSI with tifffile/PIL.
+    2. Tile the image into 512x512 windows with 256-pixel overlap.
+    3. Tissue detection: skip tiles where >90% of pixels are near-white
+       (grayscale > 240) -- background filtering.
+    4. Batch-process tiles (default batch_size=8): each tile goes through the
+       same feature extraction + distance prediction + instance separation +
+       SAM2 refinement as patch mode.
+    5. Translate polygon coordinates by each tile's (x_offset, y_offset) so
+       they are in WSI space.
+    6. Stream GeoJSON features to disk incrementally (line by line) to avoid
+       memory exhaustion on multi-gigapixel slides.
+    7. Periodically clear CUDA cache between batches.
+
+  Key CLI arguments:
+    --input              Path to WSI file
+    --output-dir         Output directory (creates tubules.geojson inside)
+    --tile-size 512      Size of each tile (default 512)
+    --overlap 256        Overlap between adjacent tiles (default 256)
+    --batch-size 8       Number of tiles processed in parallel (default 8)
+    --min-tissue 0.1     Minimum tissue fraction to process a tile (default 0.1)
+    --min-tubule-area    Minimum tubule area in pixels
+    --max-tubule-area    Maximum tubule area in pixels
+    --visualize N        Save N tile preview images with contours drawn
+
+  Command:
+    python wsi_inference.py --input slide.tif --output-dir wsi_tubule_output
+
+
+STEP 4 -- POST-PROCESSING  (merge_segmentation.py)
+----------------------------------------------------
+Cleans up the WSI GeoJSON output to handle tile-boundary artifacts and
+overlapping/touching detections that span multiple tiles.
+
+Two-stage algorithm:
+  Stage 1 -- Artifact removal:
+    Identifies polygons with long straight horizontal or vertical edges (>70 px
+    length, <5 px width corridor). These are characteristic of cut-off tubules
+    at tile boundaries and are removed.
+
+  Stage 2 -- Neighbor resolution (via STRtree spatial index for efficiency):
+    For each pair of overlapping polygons:
+      - If overlap > merge_thresh (default 0.75): union them into one tubule.
+      - If overlap > water_thresh (default 0.3) but < merge_thresh: apply
+        distance-transform watershed (via rasterio + scipy) to try to
+        separate them at the tightest constriction.
+
+Output is written incrementally (streaming) to avoid loading the full GeoJSON.
+
+Command:
+  python merge_segmentation.py \
+    -i wsi_tubule_output/tubules.geojson \
+    -o wsi_tubule_output/tubules_processed.geojson \
+    --merge 0.8 \
+    --water 0.3
+
+
+--------------------------------------------------------------------------------
+MODELS USED
+--------------------------------------------------------------------------------
+1. OpenMidnight (DINOv2-G)
+   - Type: Vision Transformer (ViT-Giant)
+   - Pretrained on: large natural image corpus via DINO v2 self-supervised learning
+   - Role: Semantic feature extractor; outputs 1536-dim patch tokens
+   - Status in pipeline: Frozen (no gradient updates during training)
+   - Weights: Downloaded automatically from HuggingFace Hub
+
+2. SAM2.1 Hiera B+ (Meta's Segment Anything Model 2)
+   - Type: Hierarchical Vision Transformer encoder + interactive mask decoder
+   - Role: (a) Feature extractor providing 256-dim spatial features (frozen
+             encoder); (b) Prompt-based mask refinement using box + mask hints
+             (interactive decoder used at inference time)
+   - Status in pipeline: Encoder frozen; decoder used with prompts at inference
+   - Weights: sam2.1_hiera_base_plus.pt  (must be placed in checkpoints/)
+
+3. AlignmentBridge + DistanceHead (~2M trainable parameters total)
+   - Role: The only components trained in this project
+   - AlignmentBridge fuses OpenMidnight + SAM2 features
+   - DistanceHead predicts the distance-to-boundary map
+   - Saved weights: checkpoints/best_distance_model.pt
+
+
+--------------------------------------------------------------------------------
+ENVIRONMENT SETUP
+--------------------------------------------------------------------------------
+Requirements: conda, CUDA-capable GPU (CUDA 11.8 compatible)
+
+  # Create and activate the environment
+  conda env create -f environment.yaml
+  conda activate tubule_segmentation
+
+  # Download SAM2 checkpoint and place it in checkpoints/
+  # File needed: sam2.1_hiera_base_plus.pt
+  # (OpenMidnight weights are downloaded automatically via huggingface_hub)
+
+Key dependencies:
+  torch 2.1 + torchvision (CUDA 11.8)
+  opencv-python, numpy, scipy, scikit-image
+  albumentations           (data augmentation)
+  huggingface_hub          (OpenMidnight weight download)
+  sam2                     (Meta SAM2 library)
+  shapely                  (polygon geometry validation)
+  rasterio                 (watershed post-processing)
+  tifffile                 (large TIFF reading)
+  ijson                    (streaming JSON parsing for large GeoJSONs)
+
+
+--------------------------------------------------------------------------------
+OUTPUT FORMAT
+--------------------------------------------------------------------------------
+All output is a GeoJSON FeatureCollection compatible with QuPath:
+
+  {
+    "type": "FeatureCollection",
+    "features": [
+      {
+        "type": "Feature",
+        "id": "0",
+        "geometry": {
+          "type": "Polygon",
+          "coordinates": [[[x1,y1], [x2,y2], ..., [x1,y1]]]
+        },
+        "properties": {
+          "objectType": "annotation",
+          "classification": {"name": "Tubule", "colorRGB": -65536},
+          "isLocked": false,
+          "measurements": [
+            {"name": "Confidence", "value": 0.95},
+            {"name": "Area px",    "value": 12345.5}
+          ]
+        }
+      },
+      ...
+    ]
+  }
+
+Each polygon is a closed ring (first == last coordinate). Coordinates are in
+pixel space relative to the image (or the WSI origin). The "Confidence" value
+comes from SAM2's mask quality score; "Area px" is the pixel area of the polygon.
+
+
+--------------------------------------------------------------------------------
+FULL PIPELINE EXAMPLE (WSI)
+--------------------------------------------------------------------------------
+  # 1. (One-time) Preprocess training data
+  python data_preprocessing.py ./raw_data ./data_combined
+
+  # 2. (One-time) Train the model
+  python train.py
+
+  # 3. Run inference on a whole slide image
+  python wsi_inference.py \
+    --input my_slide.tif \
+    --output-dir my_slide_output
+
+  # 4. Post-process to clean up artifacts and overlaps
+  python merge_segmentation.py \
+    -i my_slide_output/tubules.geojson \
+    -o my_slide_output/tubules_processed.geojson \
+    --merge 0.8 --water 0.3
+
+  # Load tubules_processed.geojson into QuPath for visualization/analysis.
+
+
+--------------------------------------------------------------------------------
+FULL PIPELINE EXAMPLE (single patch)
+--------------------------------------------------------------------------------
+  python patch_inference.py my_patch.png my_patch_tubules.geojson
+
+
+================================================================================
+END OF OVERVIEW
+================================================================================

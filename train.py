@@ -16,6 +16,14 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from scipy import ndimage
 
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+print(f"Using device: {DEVICE}")
+
 # ============== Configuration ==============
 IMG_SIZE = 1024
 DINO_SIZE = 1022
@@ -262,22 +270,59 @@ class DistanceModel(nn.Module):
 # ============== Loss ==============
 
 class DistanceLoss(nn.Module):
-    """MSE + Peak-weighted loss to emphasize centers."""
-    
-    def __init__(self, mse_weight=1.0, peak_weight=1.0):
+    """
+    MSE + Peak-weighted MSE + Dice + Boundary-weighted loss.
+
+    Why each term:
+      mse_loss        -- base regression signal
+      weighted_mse    -- emphasizes tubule centers (high distance values) so
+                         peaks in the distance map are sharp and well-localised
+      dice_loss       -- ratio-based foreground overlap; small tubules (whose
+                         distance values only reach ~0.05-0.15) contribute
+                         equally to large ones, fixing the MSE size-bias
+      boundary_mse    -- upweights near-zero pixels where touching tubules
+                         share a boundary; sharp valleys there are the key
+                         signal for instance separation at inference time
+    """
+
+    def __init__(self, mse_weight=1.0, peak_weight=1.0, dice_weight=0.5, boundary_weight=2.0):
         super().__init__()
         self.mse_weight = mse_weight
         self.peak_weight = peak_weight
-    
+        self.dice_weight = dice_weight
+        self.boundary_weight = boundary_weight
+
     def forward(self, pred, target):
+        # 1. Base MSE
         mse_loss = F.mse_loss(pred, target)
-        
-        # We explicitly weight the centers more because tubules have distinct centers
-        # but ambiguous/touching boundaries. This forces the model to focus on the cores.
+
+        # 2. Peak-weighted MSE — focus on tubule centres
         weights = 1.0 + target * 4.0
         weighted_mse = (weights * (pred - target) ** 2).mean()
-        
-        return self.mse_weight * mse_loss + self.peak_weight * weighted_mse
+
+        # 3. Dice loss on soft-binarised distance map.
+        #    Threshold at 0.05 so small tubules (max dist ~5 px → normalised ~0.1)
+        #    are captured in the foreground mask.
+        pred_binary = torch.sigmoid((pred - 0.05) * 30)
+        target_binary = (target > 0.05).float()
+        intersection = (pred_binary * target_binary).sum(dim=(1, 2, 3))
+        dice_loss = 1 - (2 * intersection + 1e-6) / (
+            pred_binary.sum(dim=(1, 2, 3)) + target_binary.sum(dim=(1, 2, 3)) + 1e-6
+        )
+        dice_loss = dice_loss.mean()
+
+        # 4. Boundary-weighted MSE — foreground pixels close to a tubule edge
+        #    (distance 0.01–0.15) are the hardest but most critical for splitting.
+        near_boundary = ((target > 0.01) & (target < 0.15)).float()
+        denom = near_boundary.sum() + 1e-6
+        boundary_mse = (near_boundary * (pred - target) ** 2).sum() / denom
+
+        return (
+            self.mse_weight * mse_loss
+            + self.peak_weight * weighted_mse
+            + self.dice_weight * dice_loss
+            + self.boundary_weight * boundary_mse
+        )
 
 
 # ============== Feature Extraction ==============
@@ -333,22 +378,22 @@ def main():
     print("\n[1/4] Loading OpenMidnight...")
     dl_loc = hf_hub_download(repo_id="SophontAI/OpenMidnight", filename="teacher_checkpoint_load.pt")
     midnight = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14_reg', pretrained=False)
-    cp = torch.load(dl_loc, map_location="cuda")
+    cp = torch.load(dl_loc, map_location=DEVICE)
     midnight.pos_embed = nn.Parameter(cp["pos_embed"])
     midnight.load_state_dict(cp)
-    midnight = midnight.cuda().eval()
+    midnight = midnight.to(DEVICE).eval()
     for p in midnight.parameters():
         p.requires_grad = False
     print("OpenMidnight loaded")
-    
+
     print("\n[2/4] Loading SAM2...")
-    sam2_enc = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device="cuda").image_encoder.eval()
+    sam2_enc = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=DEVICE).image_encoder.eval()
     for p in sam2_enc.parameters():
         p.requires_grad = False
     print("SAM2 loaded")
-    
+
     print("\n[3/4] Creating model...")
-    model = DistanceModel().cuda()
+    model = DistanceModel().to(DEVICE)
     print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
@@ -401,7 +446,9 @@ def main():
     ])
     
     dataset = KidneyDistanceDataset("./data_combined", transform)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
+    num_workers = 0 if DEVICE == "mps" else 8
+    pin_memory = DEVICE == "cuda"
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, drop_last=True)
     print(f"{len(loader)} batches")
     
     os.makedirs("checkpoints", exist_ok=True)
@@ -418,9 +465,9 @@ def main():
         t0 = time.time()
         
         for i, (images, masks, targets) in enumerate(loader):
-            images = images.cuda(non_blocking=True)
-            masks = masks.cuda(non_blocking=True)
-            targets = targets.float().cuda(non_blocking=True)
+            images = images.to(DEVICE, non_blocking=True)
+            masks = masks.to(DEVICE, non_blocking=True)
+            targets = targets.float().to(DEVICE, non_blocking=True)
             
             # 1. Forward Pass
             with torch.no_grad():

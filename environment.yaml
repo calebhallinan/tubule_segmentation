@@ -1,15 +1,13 @@
 name: tubule_segmentation
 channels:
   - pytorch
-  - nvidia
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
-  - pytorch=2.1
+  - pytorch>=2.5
   - torchvision
-  - pytorch-cuda=11.8
-  - numpy
+  - numpy<2
   - scipy
   - matplotlib
   - tqdm
@@ -18,7 +16,6 @@ dependencies:
     - opencv-python
     - albumentations
     - huggingface_hub
-    - sam2
     - rasterio
     - shapely
     - tifffile

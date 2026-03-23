@@ -8,6 +8,15 @@ with SAM2 refinement. Processes large images by tiling with batched inference.
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+# Device selection: CUDA > MPS (Apple Silicon) > CPU
+import torch as _torch
+if _torch.cuda.is_available():
+    DEVICE = "cuda"
+elif _torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
 import cv2
 import torch
 import numpy as np
@@ -24,6 +33,9 @@ from PIL import Image
 from typing import List, Dict, Tuple
 import warnings
 from shapely.geometry import Polygon as ShapePolygon
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
+from scipy import ndimage as ndi
 warnings.filterwarnings('ignore')
 
 # ============== Configuration ==============
@@ -37,6 +49,7 @@ DISTANCE_MODEL_PATH = "checkpoints/best_distance_model.pt"
 ERODE_ITER = 5
 MIN_AREA = 30
 THRESH_FACTOR = 0.8
+MIN_CONFIDENCE = 0.7
 
 # Tubule size filters (in pixels at full resolution)
 MIN_TUBULE_AREA = 2000
@@ -111,20 +124,20 @@ def load_models():
     # Load Midnight (DINOv2)
     dl_loc = hf_hub_download(repo_id="SophontAI/OpenMidnight", filename="teacher_checkpoint_load.pt")
     midnight = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitg14_reg', pretrained=False)
-    cp = torch.load(dl_loc, map_location="cuda", weights_only=False)
+    cp = torch.load(dl_loc, map_location=DEVICE, weights_only=False)
     midnight.pos_embed = nn.Parameter(cp["pos_embed"])
     midnight.load_state_dict(cp)
-    midnight = midnight.cuda().eval()
+    midnight = midnight.to(DEVICE).eval()
     print("  ✓ Midnight loaded")
-    
+
     # Load SAM2 encoder and predictor
-    sam2_enc = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device="cuda").image_encoder.eval()
-    sam2_predictor = SAM2ImagePredictor(build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device="cuda"))
+    sam2_enc = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=DEVICE).image_encoder.eval()
+    sam2_predictor = SAM2ImagePredictor(build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=DEVICE))
     print("  ✓ SAM2 loaded")
-    
+
     # Load distance model
-    model = DistanceModel().cuda().eval()
-    model.load_state_dict(torch.load(DISTANCE_MODEL_PATH, map_location="cuda", weights_only=False)['model'])
+    model = DistanceModel().to(DEVICE).eval()
+    model.load_state_dict(torch.load(DISTANCE_MODEL_PATH, map_location=DEVICE, weights_only=False)['model'])
     print("  ✓ Distance model loaded")
     
     return midnight, sam2_enc, sam2_predictor, model
@@ -165,77 +178,98 @@ def extract_features_batch(midnight, sam2_enc, img_tensors):
 
 
 def distance_to_instances(distance_map):
-    """Convert distance map to instance masks."""
-    # Convert float map to uint8 for OpenCV processing
+    """Convert distance map to instance masks using watershed segmentation.
+
+    Uses local maxima of the distance map as seeds (tubule centers) and
+    grows each region via watershed. This handles touching tubules more
+    robustly than fixed erosion because it adapts to tubule size and shape.
+    """
+    # Binarize using Otsu threshold with leniency factor
     dist_uint8 = (distance_map * 255).astype(np.uint8)
-    
-    # Calculate global Otsu threshold, then apply a factor for leniency
     thresh_val, _ = cv2.threshold(dist_uint8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    _, binary = cv2.threshold(dist_uint8, int(thresh_val * THRESH_FACTOR), 255, cv2.THRESH_BINARY)
-    binary = (binary > 0).astype(np.uint8)
-    
-    # 1. Erosion: Shrink masks to separate touching tubule boundaries (seeds)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    eroded = cv2.erode(binary, kernel, iterations=ERODE_ITER)
-    
-    # Identify distinct tubule candidates
-    num_labels, labels = cv2.connectedComponents(eroded)
-    
+    _, binary_cv = cv2.threshold(dist_uint8, int(thresh_val * THRESH_FACTOR), 255, cv2.THRESH_BINARY)
+    binary = (binary_cv > 0)
+
+    # Find local maxima in the distance map — these are the tubule centers.
+    # min_distance=8 prevents two peaks being placed in the same tubule.
+    # threshold_rel=0.3 ignores weak bumps below 30% of the image maximum.
+    coords = peak_local_max(distance_map, min_distance=8, threshold_rel=0.3, labels=binary)
+
+    if len(coords) == 0:
+        return []
+
+    # Build a marker image: each peak becomes a uniquely labelled seed
+    peak_mask = np.zeros(distance_map.shape, dtype=bool)
+    peak_mask[coords[:, 0], coords[:, 1]] = True
+    markers, _ = ndi.label(peak_mask)
+
+    # Watershed grows each seed uphill through the distance map.
+    # Negative sign because skimage watershed finds minima.
+    labels = watershed(-distance_map, markers, mask=binary)
+
     masks = []
-    # 2. Re-expansion: Dilate the seeds back to their original size 
-    # but strictly contained within the original binary mask
-    for i in range(1, num_labels):
-        seed = (labels == i).astype(np.uint8)
-        dilated = cv2.dilate(seed, kernel, iterations=ERODE_ITER)
-        final = dilated & binary
-        if final.sum() >= MIN_AREA:
-            masks.append(final)
-    
-    # 3. Collision Resolution: Handle pixels claimed by multiple dilated instances
-    if len(masks) > 1:
-        combined = sum((m > 0).astype(np.int32) for m in masks)
-        if (combined > 1).any():
-            # Calculate the geometric centers (centroids) of each candidate instance
-            centroids = [(np.where(m > 0)[1].mean(), np.where(m > 0)[0].mean()) for m in masks]
-            new_masks = [m.copy() for m in masks]
-            
-            # Resolve overlapping pixels by assigning them to the nearest centroid
-            for y, x in zip(*np.where(combined > 1)):
-                best = np.argmin([(x - cx)**2 + (y - cy)**2 for cx, cy in centroids])
-                for i in range(len(new_masks)):
-                    new_masks[i][y, x] = 1 if i == best else 0
-            masks = new_masks
-    
+    for label_id in range(1, labels.max() + 1):
+        mask = (labels == label_id).astype(np.uint8)
+        if mask.sum() >= MIN_AREA:
+            masks.append(mask)
+
     return masks
 
 
-def refine_with_sam2(image, rough_masks, sam2_predictor):
-    """Refine rough masks using SAM2."""
+def refine_with_sam2(image, rough_masks, sam2_predictor, distance_map=None):
+    """Refine rough masks using SAM2.
+
+    Improvements over baseline:
+    - Adds a positive point prompt at the peak of the distance map inside each
+      instance, giving SAM2 a strong center-of-mass cue for better localization.
+    - Filters out predictions with SAM2 confidence below MIN_CONFIDENCE to
+      remove low-quality false positives.
+    """
     if not rough_masks:
         return [], []
-    
+
     sam2_predictor.set_image(image)
     refined, scores = [], []
     scale = IMG_SIZE / OUTPUT_SIZE
-    
+
     for mask in rough_masks:
         ys, xs = np.where(mask > 0)
         if len(xs) == 0:
             continue
-        
-        # Format the mask hint for SAM2's expected input (-3 to +3 logic)
+
+        # Format the mask hint for SAM2's expected input (-3 to +3 range)
         mask_hint = cv2.resize(mask.astype(np.float32), (256, 256), interpolation=cv2.INTER_LINEAR)
-        mask_tensor = torch.from_numpy((mask_hint * 6.0) - 3.0).unsqueeze(0).unsqueeze(0).cuda()
-        
-        # Create a bounding box prompt tightly enclosing the rough instance
+        mask_tensor = torch.from_numpy((mask_hint * 6.0) - 3.0).unsqueeze(0).unsqueeze(0).to(DEVICE)
+
+        # Bounding box enclosing the rough instance
         box = np.array([xs.min() * scale, ys.min() * scale, xs.max() * scale, ys.max() * scale])
-        
-        # Predict 3 multimasks and select the best scoring one
-        preds, score_preds, _ = sam2_predictor.predict(box=box, mask_input=mask_tensor, multimask_output=True)
+
+        # Point prompt at the distance-map peak inside this instance.
+        # The highest-distance pixel is the tubule center — the strongest
+        # possible localization hint for SAM2.
+        point_coords, point_labels = None, None
+        if distance_map is not None:
+            peak_idx = distance_map[ys, xs].argmax()
+            point_coords = np.array([[float(xs[peak_idx]) * scale, float(ys[peak_idx]) * scale]])
+            point_labels = np.array([1])
+
+        preds, score_preds, _ = sam2_predictor.predict(
+            box=box,
+            mask_input=mask_tensor,
+            point_coords=point_coords,
+            point_labels=point_labels,
+            multimask_output=True
+        )
         best = score_preds.argmax()
+        best_score = float(score_preds[best])
+
+        # Discard low-confidence predictions
+        if best_score < MIN_CONFIDENCE:
+            continue
+
         refined.append(preds[best])
-        scores.append(float(score_preds[best]))
-    
+        scores.append(best_score)
+
     return refined, scores
 
 
@@ -459,7 +493,7 @@ class WSITubuleSegmenter:
             # Stack into batch tensor
             batch_tensor = torch.from_numpy(np.stack([
                 t.transpose(2, 0, 1) for t in tiles
-            ])).float().cuda()
+            ])).float().to(DEVICE)
             
             # Extract features for entire batch
             m_feats, s_feats = extract_features_batch(self.midnight, self.sam2_enc, batch_tensor)
@@ -474,15 +508,15 @@ class WSITubuleSegmenter:
                 
                 # Convert to instances
                 rough_masks = distance_to_instances(distance_map)
-                
+
                 # Refine with SAM2 (requires original image)
                 orig_tile = original_tiles[i]
                 if orig_tile.shape[0] != IMG_SIZE or orig_tile.shape[1] != IMG_SIZE:
                     orig_tile_resized = cv2.resize(orig_tile, (IMG_SIZE, IMG_SIZE))
                 else:
                     orig_tile_resized = orig_tile
-                
-                refined_masks, scores = refine_with_sam2(orig_tile_resized, rough_masks, self.sam2_predictor)
+
+                refined_masks, scores = refine_with_sam2(orig_tile_resized, rough_masks, self.sam2_predictor, distance_map)
                 
                 # Scale masks back if needed
                 h, w = original_tiles[i].shape[:2]
@@ -588,7 +622,7 @@ class WSITubuleSegmenter:
                   f"tubules found: {len(all_features)}", end="")
             
             # Clear CUDA cache periodically
-            if batch_end % (self.batch_size * 10) == 0:
+            if batch_end % (self.batch_size * 10) == 0 and DEVICE == "cuda":
                 torch.cuda.empty_cache()
         
         print(f"\n\n{'='*60}")
